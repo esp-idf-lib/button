@@ -7,7 +7,7 @@ components:
     groups: []
     code_owners:
       - name: UncleRus
-    depneds:
+    depends:
       - name: driver
     thread_safe: yes
     targets:
