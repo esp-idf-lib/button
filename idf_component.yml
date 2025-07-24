@@ -1,0 +1,27 @@
+---
+version: 1.0.0
+description: HW timer-based driver for GPIO buttons
+license: MIT
+targets:
+  - esp32
+  - esp32c2
+  - esp32c3
+  - esp32c5
+  - esp32c6
+  - esp32c61
+  - esp32h2
+  - esp32p4
+  - esp32s2
+  - esp32s3
+  - esp8266
+dependencies: {}
+maintainers:
+  - Ruslan V. Uss (@UncleRus) <unclerus@gmail.com>
+url: https://github.com/esp-idf-lib/core
+repository: https://github.com/esp-idf-lib/button
+documentation: https://esp-idf-lib.github.io/button/
+issues: https://github.com/esp-idf-lib/button/issues
+discussion: https://github.com/esp-idf-lib/core/discussions
+files:
+  exclude:
+    - docs
