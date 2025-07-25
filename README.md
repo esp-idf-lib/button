@@ -11,7 +11,7 @@ HW timer-based driver for GPIO buttons.
 ## Installation
 
 ```sh
-idf.py add-dependency "esp-idf-lib/button^1.0.0
+idf.py add-dependency esp-idf-lib/button^1.0.0
 ```
 
 ## Support
