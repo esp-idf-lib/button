@@ -1,5 +1,5 @@
 ---
-version: 1.0.2
+version: 1.0.3
 description: HW timer-based driver for GPIO buttons
 license: MIT
 targets:
