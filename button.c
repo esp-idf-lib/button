@@ -117,7 +117,8 @@ static void poll(void *arg)
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const esp_timer_create_args_t timer_args = {
+static const esp_timer_create_args_t timer_args =
+{
     .arg = NULL,
     .name = "poll_buttons",
     .dispatch_method = ESP_TIMER_TASK,

@@ -5,7 +5,8 @@
 
 static const char *TAG = "button_example";
 
-static const char *states[] = {
+static const char *states[] =
+{
     [BUTTON_PRESSED]      = "pressed",
     [BUTTON_RELEASED]     = "released",
     [BUTTON_CLICKED]      = "clicked",

@@ -54,7 +54,8 @@ typedef struct button_s button_t;
 /**
  * Button states/events
  */
-typedef enum {
+typedef enum
+{
     BUTTON_PRESSED = 0,
     BUTTON_RELEASED,
     BUTTON_CLICKED,
@@ -80,7 +81,8 @@ struct button_s
     bool autorepeat;                //!< Enable autorepeat
     button_event_cb_t callback;     //!< Button callback
     void *ctx;                      //!< User data
-    struct {
+    struct
+    {
         button_state_t state;
         uint32_t pressed_time;
         uint32_t repeating_time;
