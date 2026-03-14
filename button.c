@@ -33,151 +33,230 @@
  * MIT Licensed as described in the file LICENSE
  */
 #include "button.h"
+#include <stdlib.h>
 #include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
-#define DEAD_TIME_US 50000 // 50ms
 
-#define POLL_TIMEOUT_US        (CONFIG_BUTTON_POLL_TIMEOUT * 1000)
-#define AUTOREPEAT_TIMEOUT_US  (CONFIG_BUTTON_AUTOREPEAT_TIMEOUT * 1000)
-#define AUTOREPEAT_INTERVAL_US (CONFIG_BUTTON_AUTOREPEAT_INTERVAL * 1000)
-#define LONG_PRESS_TIMEOUT_US  (CONFIG_BUTTON_LONG_PRESS_TIMEOUT * 1000)
-
-static button_t *buttons[CONFIG_BUTTON_MAX] = { NULL };
-static esp_timer_handle_t timer = NULL;
-
-#define CHECK(x) do { esp_err_t __; if ((__ = x) != ESP_OK) return __; } while (0)
 #define CHECK_ARG(VAL) do { if (!(VAL)) return ESP_ERR_INVALID_ARG; } while (0)
 
-static void poll_button(button_t *btn)
+struct button
 {
-    if (btn->internal.state == BUTTON_PRESSED && btn->internal.pressed_time < DEAD_TIME_US)
+    button_config_t config;
+    esp_timer_handle_t timer;
+    SemaphoreHandle_t lock;
+    button_state_t state;
+    uint32_t pressed_time;
+    uint32_t repeating_time;
+    bool monitoring;              // interrupt mode: true when esp_timer periodic is running
+};
+
+static inline void emit_event(button_handle_t btn, button_state_t type)
+{
+    button_event_t ev = { .type = type, .sender = btn };
+    btn->config.callback(&ev, btn->config.callback_ctx);
+}
+
+static void poll_button(button_handle_t btn)
+{
+    if (btn->state == BUTTON_PRESSED && btn->pressed_time < btn->config.dead_time_us)
     {
         // Dead time, ignore all
-        btn->internal.pressed_time += POLL_TIMEOUT_US;
+        btn->pressed_time += btn->config.poll_interval_us;
         return;
     }
 
-    if (gpio_get_level(btn->gpio) == btn->pressed_level)
+    if (gpio_get_level(btn->config.gpio) == btn->config.pressed_level)
     {
         // button is pressed
-        if (btn->internal.state == BUTTON_RELEASED)
+        if (btn->state == BUTTON_RELEASED)
         {
             // pressing just started, reset pressing/repeating time and run callback
-            btn->internal.state = BUTTON_PRESSED;
-            btn->internal.pressed_time = 0;
-            btn->internal.repeating_time = 0;
-            btn->callback(btn, BUTTON_PRESSED);
+            btn->state = BUTTON_PRESSED;
+            btn->pressed_time = 0;
+            btn->repeating_time = 0;
+            emit_event(btn, BUTTON_PRESSED);
             return;
         }
         // increment pressing time
-        btn->internal.pressed_time += POLL_TIMEOUT_US;
+        btn->pressed_time += btn->config.poll_interval_us;
 
         // check autorepeat
-        if (btn->autorepeat)
+        if (btn->config.autorepeat)
         {
             // check autorepeat timeout
-            if (btn->internal.pressed_time < AUTOREPEAT_TIMEOUT_US)
+            if (btn->pressed_time < btn->config.autorepeat_timeout_us)
                 return;
             // increment repeating time
-            btn->internal.repeating_time += POLL_TIMEOUT_US;
+            btn->repeating_time += btn->config.poll_interval_us;
 
-            if (btn->internal.repeating_time >= AUTOREPEAT_INTERVAL_US)
+            if (btn->repeating_time >= btn->config.autorepeat_interval_us)
             {
                 // reset repeating time and run callback
-                btn->internal.repeating_time = 0;
-                btn->callback(btn, BUTTON_CLICKED);
+                btn->repeating_time = 0;
+                emit_event(btn, BUTTON_CLICKED);
             }
             return;
         }
 
-        if (btn->internal.state == BUTTON_PRESSED && btn->internal.pressed_time >= LONG_PRESS_TIMEOUT_US)
+        if (btn->state == BUTTON_PRESSED && btn->pressed_time >= btn->config.long_press_time_us)
         {
-            // button perssed long time, change state and run callback
-            btn->internal.state = BUTTON_PRESSED_LONG;
-            btn->callback(btn, BUTTON_PRESSED_LONG);
+            // button pressed long time, change state and run callback
+            btn->state = BUTTON_PRESSED_LONG;
+            emit_event(btn, BUTTON_PRESSED_LONG);
         }
     }
-    else if (btn->internal.state != BUTTON_RELEASED)
+    else if (btn->state != BUTTON_RELEASED)
     {
         // button released
-        bool clicked = btn->internal.state == BUTTON_PRESSED;
-        btn->internal.state = BUTTON_RELEASED;
-        btn->callback(btn, BUTTON_RELEASED);
+        bool clicked = btn->state == BUTTON_PRESSED
+                       && !(btn->config.autorepeat && btn->pressed_time >= btn->config.autorepeat_timeout_us);
+        btn->state = BUTTON_RELEASED;
+        emit_event(btn, BUTTON_RELEASED);
         if (clicked)
-            btn->callback(btn, BUTTON_CLICKED);
+        {
+            emit_event(btn, BUTTON_CLICKED);
+        }
     }
 }
 
-static void poll(void *arg)
+static void button_timer_handler(void *arg)
 {
-    for (size_t i = 0; i < CONFIG_BUTTON_MAX; i++)
-        if (buttons[i] && buttons[i]->callback)
-            poll_button(buttons[i]);
+    button_handle_t btn = (button_handle_t)arg;
+    xSemaphoreTake(btn->lock, portMAX_DELAY);
+
+    poll_button(btn);
+
+    if (btn->config.mode == BUTTON_MODE_INTERRUPT)
+    {
+        if (btn->state == BUTTON_RELEASED)
+        {
+            // Button released (or false trigger): stop monitoring and re-enable interrupt
+            if (btn->monitoring)
+            {
+                esp_timer_stop(btn->timer);
+                btn->monitoring = false;
+            }
+            gpio_intr_enable(btn->config.gpio);
+        }
+        else if (!btn->monitoring)
+        {
+            // Debounce confirmed press: switch to periodic monitoring
+            esp_timer_start_periodic(btn->timer, btn->config.poll_interval_us);
+            btn->monitoring = true;
+        }
+    }
+
+    xSemaphoreGive(btn->lock);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Interrupt mode helpers
+
+static void IRAM_ATTR button_isr_handler(void *arg)
+{
+    button_handle_t btn = (button_handle_t)arg;
+    gpio_intr_disable(btn->config.gpio);
+    esp_timer_start_once(btn->timer, 0);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const esp_timer_create_args_t timer_args =
+esp_err_t button_create(const button_config_t *config, button_handle_t *handle)
 {
-    .arg = NULL,
-    .name = "poll_buttons",
-    .dispatch_method = ESP_TIMER_TASK,
-    .callback = poll,
-};
+    CHECK_ARG(handle && config && config->callback);
 
-esp_err_t button_init(button_t *btn)
-{
-    CHECK_ARG(btn);
+    esp_err_t err;
 
-    if (!timer)
-        CHECK(esp_timer_create(&timer_args, &timer));
+    button_handle_t btn = calloc(1, sizeof(struct button));
+    if (!btn)
+        return ESP_ERR_NO_MEM;
 
-    esp_timer_stop(timer);
+    btn->config = *config;
+    btn->state = BUTTON_RELEASED;
 
-    esp_err_t res = ESP_ERR_NO_MEM;
-
-    for (size_t i = 0; i < CONFIG_BUTTON_MAX; i++)
+    btn->lock = xSemaphoreCreateMutex();
+    if (!btn->lock)
     {
-        if (buttons[i] == btn)
-            break;
-
-        if (!buttons[i])
-        {
-            btn->internal.state = BUTTON_RELEASED;
-            btn->internal.pressed_time = 0;
-            btn->internal.repeating_time = 0;
-            res = gpio_set_direction(btn->gpio, GPIO_MODE_INPUT);
-            if (res != ESP_OK) break;
-            if (btn->internal_pull)
-            {
-                res = gpio_set_pull_mode(btn->gpio, btn->pressed_level ? GPIO_PULLDOWN_ONLY : GPIO_PULLUP_ONLY);
-                if (res != ESP_OK) break;
-            }
-            buttons[i] = btn;
-            break;
-        }
+        err = ESP_ERR_NO_MEM;
+        goto fail;
     }
 
-    CHECK(esp_timer_start_periodic(timer, POLL_TIMEOUT_US));
-    return res;
+    err = gpio_set_direction(btn->config.gpio, GPIO_MODE_INPUT);
+    if (err != ESP_OK)
+        goto fail_lock;
+
+    if (btn->config.enable_internal_pull)
+    {
+        err = gpio_set_pull_mode(btn->config.gpio, btn->config.pressed_level ? GPIO_PULLDOWN_ONLY : GPIO_PULLUP_ONLY);
+        if (err != ESP_OK)
+            goto fail_lock;
+    }
+
+    const esp_timer_create_args_t timer_args =
+    {
+        .name = "__button__",
+        .arg = btn,
+        .callback = button_timer_handler,
+        .dispatch_method = ESP_TIMER_TASK
+    };
+
+    err = esp_timer_create(&timer_args, &btn->timer);
+    if (err != ESP_OK)
+        goto fail_lock;
+
+    if (btn->config.mode == BUTTON_MODE_INTERRUPT)
+    {
+        err = gpio_set_intr_type(btn->config.gpio, GPIO_INTR_ANYEDGE);
+        if (err != ESP_OK)
+            goto fail_timer;
+
+        err = gpio_isr_handler_add(btn->config.gpio, button_isr_handler, btn);
+        if (err != ESP_OK)
+            goto fail_timer;
+    }
+    else
+    {
+        // Poll mode: start periodic timer immediately
+        err = esp_timer_start_periodic(btn->timer, btn->config.poll_interval_us);
+        if (err != ESP_OK)
+            goto fail_timer;
+    }
+
+    *handle = btn;
+
+    return ESP_OK;
+
+fail_timer:
+    esp_timer_delete(btn->timer);
+fail_lock:
+    vSemaphoreDelete(btn->lock);
+fail:
+    free(btn);
+    return err;
 }
 
-esp_err_t button_done(button_t *btn)
+esp_err_t button_delete(button_handle_t handle)
 {
-    CHECK_ARG(btn);
+    CHECK_ARG(handle);
 
-    esp_timer_stop(timer);
+    if (handle->config.mode == BUTTON_MODE_INTERRUPT)
+    {
+        gpio_intr_disable(handle->config.gpio);
+        gpio_isr_handler_remove(handle->config.gpio);
+    }
 
-    esp_err_t res = ESP_ERR_INVALID_ARG;
+    esp_timer_stop(handle->timer);
 
-    for (size_t i = 0; i < CONFIG_BUTTON_MAX; i++)
-        if (buttons[i] == btn)
-        {
-            buttons[i] = NULL;
-            res = ESP_OK;
-            break;
-        }
+    // Drain any in-flight callback
+    xSemaphoreTake(handle->lock, portMAX_DELAY);
+    handle->monitoring = false;
+    xSemaphoreGive(handle->lock);
 
-    CHECK(esp_timer_start_periodic(timer, POLL_TIMEOUT_US));
-    return res;
+    esp_timer_delete(handle->timer);
+    vSemaphoreDelete(handle->lock);
+
+    free(handle);
+    return ESP_OK;
 }
