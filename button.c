@@ -35,9 +35,42 @@
 #include "button.h"
 #include <stdlib.h>
 #include <esp_timer.h>
+#include <esp_log.h>
+#include <esp_idf_version.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
+static const char *TAG = "button";
+
+// One button per pin: the GPIO driver keeps a single interrupt handler per pin,
+// so a second button on the same pin would silently take the handler over and
+// the first one would stop seeing presses
+static bool pins_in_use[GPIO_NUM_MAX];
+static portMUX_TYPE pins_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static esp_err_t take_pin(gpio_num_t pin)
+{
+    portENTER_CRITICAL(&pins_mux);
+    bool busy = pins_in_use[pin];
+    if (!busy)
+        pins_in_use[pin] = true;
+    portEXIT_CRITICAL(&pins_mux);
+
+    if (busy)
+    {
+        ESP_LOGE(TAG, "GPIO %d is already used by another button", pin);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return ESP_OK;
+}
+
+static void give_pin(gpio_num_t pin)
+{
+    portENTER_CRITICAL(&pins_mux);
+    pins_in_use[pin] = false;
+    portEXIT_CRITICAL(&pins_mux);
+}
 
 #define CHECK_ARG(VAL) do { if (!(VAL)) return ESP_ERR_INVALID_ARG; } while (0)
 
@@ -130,12 +163,16 @@ static void button_timer_handler(void *arg)
 
     if (btn->config.mode == BUTTON_MODE_INTERRUPT)
     {
+        esp_err_t err;
+
         if (btn->state == BUTTON_RELEASED)
         {
             // Button released (or false trigger): stop monitoring and re-enable interrupt
             if (btn->monitoring)
             {
-                esp_timer_stop(btn->timer);
+                err = esp_timer_stop(btn->timer);
+                if (err != ESP_OK)
+                    ESP_LOGE(TAG, "Could not stop the timer: %s", esp_err_to_name(err));
                 btn->monitoring = false;
             }
             gpio_intr_enable(btn->config.gpio);
@@ -143,8 +180,10 @@ static void button_timer_handler(void *arg)
         else if (!btn->monitoring)
         {
             // Debounce confirmed press: switch to periodic monitoring
-            esp_timer_start_periodic(btn->timer, btn->config.poll_interval_us);
-            btn->monitoring = true;
+            err = esp_timer_start_periodic(btn->timer, btn->config.poll_interval_us);
+            if (err != ESP_OK)
+                ESP_LOGE(TAG, "Could not start the timer: %s", esp_err_to_name(err));
+            btn->monitoring = err == ESP_OK;
         }
     }
 
@@ -154,7 +193,7 @@ static void button_timer_handler(void *arg)
 ////////////////////////////////////////////////////////////////////////////////
 // Interrupt mode helpers
 
-static void IRAM_ATTR button_isr_handler(void *arg)
+static void button_isr_handler(void *arg)
 {
     button_handle_t btn = (button_handle_t)arg;
     gpio_intr_disable(btn->config.gpio);
@@ -163,15 +202,52 @@ static void IRAM_ATTR button_isr_handler(void *arg)
 
 ////////////////////////////////////////////////////////////////////////////////
 
+static esp_err_t check_config(const button_config_t *config)
+{
+    if (!GPIO_IS_VALID_GPIO(config->gpio))
+        return ESP_ERR_INVALID_ARG;
+    if (config->mode != BUTTON_MODE_POLL && config->mode != BUTTON_MODE_INTERRUPT)
+        return ESP_ERR_INVALID_ARG;
+    if (config->pressed_level > 1)
+        return ESP_ERR_INVALID_ARG;
+    if (!config->poll_interval_us)
+        return ESP_ERR_INVALID_ARG;
+    if (config->autorepeat && !config->autorepeat_interval_us)
+        return ESP_ERR_INVALID_ARG;
+    if (!config->callback)
+        return ESP_ERR_INVALID_ARG;
+    return ESP_OK;
+}
+
+static void release_pin(const button_config_t *config)
+{
+    gpio_intr_disable(config->gpio);
+    gpio_set_intr_type(config->gpio, GPIO_INTR_DISABLE);
+    gpio_set_pull_mode(config->gpio, GPIO_FLOATING);
+}
+
 esp_err_t button_create(const button_config_t *config, button_handle_t *handle)
 {
-    CHECK_ARG(handle && config && config->callback);
+    CHECK_ARG(handle);
+    *handle = NULL;
 
-    esp_err_t err;
+    if (!config)
+        return ESP_ERR_INVALID_ARG;
+
+    esp_err_t err = check_config(config);
+    if (err != ESP_OK)
+        return err;
+
+    err = take_pin(config->gpio);
+    if (err != ESP_OK)
+        return err;
 
     button_handle_t btn = calloc(1, sizeof(struct button));
     if (!btn)
+    {
+        give_pin(config->gpio);
         return ESP_ERR_NO_MEM;
+    }
 
     btn->config = *config;
     btn->state = BUTTON_RELEASED;
@@ -231,8 +307,10 @@ esp_err_t button_create(const button_config_t *config, button_handle_t *handle)
 fail_timer:
     esp_timer_delete(btn->timer);
 fail_lock:
+    release_pin(&btn->config);
     vSemaphoreDelete(btn->lock);
 fail:
+    give_pin(btn->config.gpio);
     free(btn);
     return err;
 }
@@ -241,20 +319,39 @@ esp_err_t button_delete(button_handle_t handle)
 {
     CHECK_ARG(handle);
 
+    // Remove the handler first: after that the ISR cannot arm the timer again
     if (handle->config.mode == BUTTON_MODE_INTERRUPT)
     {
         gpio_intr_disable(handle->config.gpio);
         gpio_isr_handler_remove(handle->config.gpio);
     }
 
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 1, 0)
+    // esp_timer_stop() only unarms the timer while the callback may be running
+    // or about to run, so wait for it before the handle is freed
+    esp_timer_stop_blocking(handle->timer, portMAX_DELAY);
+#else
     esp_timer_stop(handle->timer);
+#endif
 
-    // Drain any in-flight callback
+    // An interrupt that was already in service may have armed the timer after
+    // the stop above; esp_timer_delete() refuses to delete an armed timer
+    esp_err_t err;
+    do
+    {
+        esp_timer_stop(handle->timer);
+        err = esp_timer_delete(handle->timer);
+    }
+    while (err == ESP_ERR_INVALID_STATE);
+
+    // Drain a callback that has already taken the lock
     xSemaphoreTake(handle->lock, portMAX_DELAY);
     handle->monitoring = false;
     xSemaphoreGive(handle->lock);
 
-    esp_timer_delete(handle->timer);
+    release_pin(&handle->config);
+    give_pin(handle->config.gpio);
+
     vSemaphoreDelete(handle->lock);
 
     free(handle);
