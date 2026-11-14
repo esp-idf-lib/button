@@ -39,8 +39,14 @@ void app_main()
     config2.autorepeat = true;
     config2.callback = on_button;
 
-    // Install GPIO ISR service (required before creating interrupt-mode buttons)
-    ESP_ERROR_CHECK(gpio_install_isr_service(0));
+    // Install GPIO ISR service (required before creating interrupt-mode buttons).
+    // Another component may have installed it already.
+    esp_err_t err = gpio_install_isr_service(0);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+    {
+        ESP_LOGE(TAG, "Could not install the GPIO ISR service: %s", esp_err_to_name(err));
+        return;
+    }
 
     ESP_ERROR_CHECK(button_create(&config1, &btn1));
     ESP_ERROR_CHECK(button_create(&config2, &btn2));
